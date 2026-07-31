@@ -992,17 +992,18 @@ def main():
     for l, r in zip(labels, results):
         cf = r["after_tax_cf"] if assume.tax_enabled else r["annual_cf"]
         for name, vals, band in (
-                ("Median", np.percentile(cf, 50, axis=0), "Median"),
-                ("10th pct", np.percentile(cf, 10, axis=0), "Range"),
-                ("90th pct", np.percentile(cf, 90, axis=0), "Range")):
+                ("Typical", np.percentile(cf, 50, axis=0), "Median"),
+                ("Bad case", np.percentile(cf, 10, axis=0), "Range"),
+                ("Good case", np.percentile(cf, 90, axis=0), "Range")):
             cf_frames.append(pd.DataFrame({
                 "Year": np.arange(1, yrs + 1), "CF": vals,
                 "Series": f"{l} {name}" if len(deals) > 1 else name,
                 "Deal": l, "Band": band}))
     st.altair_chart(
         by_year_chart(cf_frames, "CF",
-                      f"Annual cash flow{tax_tag} — median and 10th–90th percentile",
-                      "Annual cash flow ($)", alt),
+                      f"Money in your pocket each year{tax_tag} — typical, "
+                      f"good and bad cases",
+                      "Cash per year ($)", alt),
         use_container_width=True)
 
     # ---------------- 3. bad-luck scenario
