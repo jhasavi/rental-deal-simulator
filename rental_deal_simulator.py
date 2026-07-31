@@ -456,6 +456,86 @@ def summary_row(res: dict) -> dict:
     }
 
 
+def plain_verdict(res: dict) -> str:
+    """The whole analysis in ordinary English, for someone who does not think
+    in IRR and DSCR. This is what gets read aloud on a client call."""
+    a = res["assumptions"]
+    s = summary_row(res)
+    inp = res["inputs"]
+    cash = s["cash_invested"]
+    typical_dollars = s["coc_mean"] * cash
+    yr1, yr5 = s["p_pos_y1"], s["p_pos_y5"]
+    dscr = s["dscr_median"]
+
+    # money in, money out
+    if s["coc_mean"] >= 0:
+        line1 = (f"You put in {usd(cash)}. In a typical year this deal puts about "
+                 f"{usd(typical_dollars)} back in your pocket — that's "
+                 f"{pct(s['coc_mean'])} on your cash.")
+    else:
+        line1 = (f"You put in {usd(cash)}. In a typical year this deal costs you "
+                 f"about {usd(abs(typical_dollars))} out of pocket — that's "
+                 f"{pct(abs(s['coc_mean']))} a year against your cash.")
+
+    line2 = (f"Good years and bad years land between {pct(s['coc_p10'])} and "
+             f"{pct(s['coc_p90'])} — that spread is the honest range, not a "
+             f"single confident number.")
+
+    # odds of being cash-flow positive — each branch is a complete predicate
+    def describe(p):
+        if p >= 0.9: return "almost certainly makes money"
+        if p >= 0.7: return "probably makes money"
+        if p >= 0.45: return "is roughly a coin flip"
+        if p >= 0.15: return "probably loses money"
+        return "almost certainly loses money"
+
+    trend = ("rises to" if yr5 >= yr1 else "drifts to")
+    why = (" as rent grows while your mortgage payment stays flat"
+           if res["loan0"] > 0 else " as rent grows")
+    line3 = (f"In year 1 it {describe(yr1)} — positive {pct(yr1)} of the time. "
+             f"By year 5 that {trend} {pct(yr5)},{why}.")
+
+    # where the return actually comes from — only claim appreciation dominates
+    # when the yearly cash return is genuinely a small slice of total return
+    irr = s["irr_mean"]
+    cash_share = (s["coc_mean"] / irr) if (np.isfinite(irr) and irr > 0) else 0.0
+    if cash_share >= 0.6:
+        source = "Most of that is the rent itself, which is the safer kind of return."
+    elif cash_share >= 0.3:
+        source = ("That's a mix of the rent and the property gaining value over "
+                  "time.")
+    else:
+        source = ("Most of that is the property gaining value and the loan being "
+                  "paid down — not the monthly rent, so it only pays off if you "
+                  "hold and prices behave.")
+    line4 = (f"Held {a.years} years and sold, the whole investment averages "
+             f"{pct(irr)} a year. {source}")
+
+    # lender view
+    if not np.isfinite(dscr):
+        line5 = "With no mortgage, lender coverage rules don't apply here."
+    elif dscr >= 1.25:
+        line5 = (f"A rental-loan lender would be comfortable: the rent covers the "
+                 f"mortgage {ratio(dscr)} over, above the usual 1.25 bar.")
+    elif dscr >= 1.15:
+        line5 = (f"A rental-loan lender would be borderline: rent covers the "
+                 f"mortgage {ratio(dscr)} over — enough for a lenient lender "
+                 f"(1.15), short of a strict one (1.25).")
+    else:
+        line5 = (f"Most rental-loan lenders would decline this as it stands: rent "
+                 f"only covers {ratio(dscr)} of the mortgage, under the 1.15 "
+                 f"minimum. You'd need more money down, a lower price, or "
+                 f"higher rent.")
+
+    stress = bad_luck_year1(inp)
+    line6 = (f"If you hit a rough patch — three empty months and a big repair in "
+             f"the same year — that year costs you about "
+             f"{usd(abs(stress['delta']))} more than a normal one. Worth keeping "
+             f"that much in reserve.")
+
+    return " ".join([line1, line2, line3, line4, line5, line6])
+
+
 # ---------------------------------------------------------------- PDF export
 def build_pdf(results: list, a: Assumptions) -> bytes:
     """One-page branded client summary. `results` is a list of run_simulation dicts."""
@@ -828,17 +908,27 @@ def main():
     yrs = assume.years
     tax_tag = " (after tax)" if assume.tax_enabled else ""
 
+    # ---------------- the short version, in plain English
+    st.subheader("The short version")
+    for lab, r in zip(labels, results):
+        if len(results) > 1:
+            st.markdown(f"**{lab}**" + (f" — {r['inputs'].address}"
+                                        if r["inputs"].address else ""))
+        st.info(md(plain_verdict(r)))
+
     # ---------------- 1. cash-on-cash
-    st.subheader(f"1 · Cash-on-cash return{tax_tag} — expected value and range")
+    st.subheader(f"1 · What you earn on your cash{tax_tag}")
+    st.caption("Your yearly profit divided by the cash you put in. Pros call "
+               "this cash-on-cash return.")
     for lab, s, r in zip(labels, sums, results):
         top = st.columns(3)
-        top[0].metric(f"{lab} · mean avg CoC", pct(s["coc_mean"]))
-        top[1].metric(f"Mean IRR{tax_tag}", pct(s["irr_mean"]))
-        top[2].metric("Cash invested", usd(s["cash_invested"]))
+        top[0].metric(f"{lab} · in a typical year", pct(s["coc_mean"]))
+        top[1].metric(f"Yearly return if you sell{tax_tag}", pct(s["irr_mean"]))
+        top[2].metric("Cash you put in", usd(s["cash_invested"]))
         bot = st.columns(2)
-        bot[0].metric("CoC 10th–90th percentile",
+        bot[0].metric("Range in 8 out of 10 futures",
                       f"{pct(s['coc_p10'])} to {pct(s['coc_p90'])}")
-        bot[1].metric(f"IRR{tax_tag} 10th–90th percentile",
+        bot[1].metric("Selling return, 8 out of 10 futures",
                       f"{pct(s['irr_p10'])} to {pct(s['irr_p90'])}")
     pi_note = " · ".join(f"{l} {usd(s['monthly_payment'])}/mo"
                          for l, s in zip(labels, sums))
@@ -854,18 +944,21 @@ def main():
     irr_key = "irr_after_tax" if assume.tax_enabled else "irr"
     st.altair_chart(
         dist_chart([(l, r[coc_key] * 100) for l, r in zip(labels, results)],
-                   f"Avg annual cash-on-cash{tax_tag} (%)", alt),
+                   f"Yearly return on your cash{tax_tag} (%)", alt),
         use_container_width=True)
     irr_series = []
     for l, r in zip(labels, results):
         v = r[irr_key]
         irr_series.append((l, v[np.isfinite(v)] * 100))
     st.altair_chart(
-        dist_chart(irr_series, f"{yrs}-yr IRR{tax_tag} (%)", alt),
+        dist_chart(irr_series,
+                   f"Yearly return if you sell in year {yrs}{tax_tag} (%)", alt),
         use_container_width=True)
 
     # ---------------- 2. probability of positive cash flow
-    st.subheader("2 · Probability of positive cash flow, by year")
+    st.subheader("2 · Your odds of making money, year by year")
+    st.caption("Out of thousands of simulated futures, how often this property "
+               "puts cash in your pocket instead of taking it.")
     y5 = min(5, yrs)
     for lab, s in zip(labels, sums):
         c1, c2, _ = st.columns([1, 1, 3])
@@ -913,27 +1006,33 @@ def main():
         use_container_width=True)
 
     # ---------------- 3. bad-luck scenario
-    st.subheader("3 · Bad-luck scenario — what a rough year costs")
+    st.subheader("3 · If things go wrong")
+    st.caption("A realistic bad year: the unit sits empty for three months and "
+               "something expensive breaks. This is the reserve you should keep.")
     for lab, d, r, s in zip(labels, deals, results, sums):
         stress = bad_luck_year1(d)
         b = st.columns(3)
-        b[0].metric(f"{lab} · expected year 1 cash flow", usd(stress["expected"]))
-        b[1].metric("Stress: 3 mo vacant + $12.5k repair", usd(stress["stressed"]),
+        b[0].metric(f"{lab} · a normal first year", usd(stress["expected"]))
+        b[1].metric("3 months empty + a $12.5k repair", usd(stress["stressed"]),
                     delta=usd(stress["delta"]))
-        b[2].metric("Sim: worst year of hold (10th pct)", usd(s["worst_year_p10"]))
-    st.caption("Stress case is deterministic: three vacant months plus a mid-range "
-               "big repair in year 1, before tax. The sim figure is the 10th "
-               "percentile of each trial's single worst year — 10% of simulated "
-               "futures had a year at least this bad.")
+        b[2].metric("Worst year you should plan for", usd(s["worst_year_p10"]))
+    st.caption("The middle figure is a specific bad year worked out by hand. The "
+               "last one comes from the simulation: 1 in 10 futures contained a "
+               "year at least this bad, so it is a sensible reserve target.")
 
     # ---------------- 4. DSCR lender view
-    st.subheader("4 · DSCR lender view")
+    st.subheader("4 · Would a lender fund this?")
+    st.caption("Rental-property lenders check whether the rent covers the "
+               "mortgage. They call it DSCR; 1.25 means rent covers the payment "
+               "1.25 times over. Below 1.15 most lenders say no.")
     lo_t, hi_t = assume.dscr_thresholds
     for lab, s in zip(labels, sums):
         d1, d2, d3 = st.columns(3)
-        d1.metric(f"{lab} · median DSCR (yr 1)", ratio(s["dscr_median"]))
-        d2.metric(f"Pass rate @ {lo_t:.2f}", pct(s["dscr_pass_115"]))
-        d3.metric(f"Pass rate @ {hi_t:.2f}", pct(s["dscr_pass_125"]))
+        d1.metric(f"{lab} · rent covers the mortgage", ratio(s["dscr_median"]))
+        d2.metric(f"Odds a lenient lender says yes ({lo_t:.2f})",
+                  pct(s["dscr_pass_115"]))
+        d3.metric(f"Odds a strict lender says yes ({hi_t:.2f})",
+                  pct(s["dscr_pass_125"]))
     dscr_series = []
     for l, r in zip(labels, results):
         v = r["dscr"][:, 0]
@@ -941,30 +1040,34 @@ def main():
         if v.size:
             dscr_series.append((l, np.clip(v, 0, 3.0)))
     if dscr_series:
-        st.altair_chart(dist_chart(dscr_series, "Year-1 DSCR (NOI ÷ debt service)",
-                                   alt, fmt=".2f"), use_container_width=True)
-    st.caption(f"DSCR uses NOI (collected rent less vacancy, management, "
-               f"maintenance, taxes, insurance, HOA) divided by annual debt "
-               f"service, excluding big-repair events. Most DSCR lenders want "
-               f"{lo_t:.2f}–{hi_t:.2f}+; the pass rate is the share of simulated "
-               f"futures clearing that bar in year 1. All-cash deals show as n/a.")
+        st.altair_chart(dist_chart(
+            dscr_series, "How many times the rent covers the mortgage (year 1)",
+            alt, fmt=".2f"), use_container_width=True)
+    st.caption(f"Worked out as rent left after vacancy, management, maintenance, "
+               f"taxes, insurance and HOA, divided by the year's mortgage "
+               f"payments. Big one-off repairs are excluded, which is how lenders "
+               f"do it. Cash purchases show as n/a because there's no loan.")
 
     # ---------------- 5. refi impact
     if assume.refi_enabled:
-        st.subheader(f"5 · Refinance at year {assume.refi_year}")
+        st.subheader(f"5 · Refinancing in year {assume.refi_year}")
+        st.caption("If you replace the loan at a lower rate once the property has "
+                   "gained value, this is the cash you could take out.")
         for lab, r in zip(labels, results):
             cash_out = r["refi_cash"][:, assume.refi_year - 1]
             e1, e3 = st.columns(2)
-            e1.metric(f"{lab} · median cash out at refi", usd(np.median(cash_out)))
-            e3.metric("P(cash-in required)", pct(np.mean(cash_out < 0)))
-            st.metric("10th–90th percentile",
-                     f"{usd(np.percentile(cash_out, 10))} to "
-                     f"{usd(np.percentile(cash_out, 90))}")
-        st.caption(f"New loan sized at {pct(assume.refi_ltv)} LTV against the "
-                   f"simulated market value at year {assume.refi_year}, less the "
-                   f"old balance and {pct(assume.refi_cost_pct)} closing costs. "
-                   "Negative means the investor brings cash to close — that happens "
-                   "when appreciation disappoints.")
+            e1.metric(f"{lab} · cash you could pull out",
+                      usd(np.median(cash_out)))
+            e3.metric("Chance you'd have to bring money instead",
+                      pct(np.mean(cash_out < 0)))
+            st.metric("Range in 8 out of 10 futures",
+                      f"{usd(np.percentile(cash_out, 10))} to "
+                      f"{usd(np.percentile(cash_out, 90))}")
+        st.caption(f"Assumes a new loan for {pct(assume.refi_ltv)} of what the "
+                   f"property is worth in year {assume.refi_year}, after paying "
+                   f"off the old loan and {pct(assume.refi_cost_pct)} in closing "
+                   "costs. A negative number means prices didn't rise enough and "
+                   "you'd have to put money in to refinance.")
 
     # ---------------- summary + export
     with st.expander("Summary table (all metrics)"):
