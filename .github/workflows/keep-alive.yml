@@ -14,5 +14,14 @@ jobs:
     steps:
       - name: Ping the app
         run: |
-          curl -sL -o /dev/null -w "status: %{http_code}\n" \
-            https://namaste-rental.streamlit.app
+          # Don't follow redirects: Streamlit's own redirect chain needs a
+          # cookie jar to terminate, and curl -L without one loops until it
+          # hits --max-redirs and exits 47 (a false failure, not a dead app).
+          # A bare hit to the origin is enough to register as activity.
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://namaste-rental.streamlit.app)
+          echo "status: $code"
+          if [ "$code" -lt 200 ] || [ "$code" -ge 500 ]; then
+            echo "::error::unexpected status $code"
+            exit 1
+          fi
