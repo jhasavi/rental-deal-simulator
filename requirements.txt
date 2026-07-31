@@ -1,0 +1,5 @@
+streamlit>=1.40
+numpy>=2.0
+pandas>=2.2
+altair>=5.4
+reportlab>=4.2
