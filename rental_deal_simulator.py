@@ -768,14 +768,15 @@ def main():
     # ---------------- 1. cash-on-cash
     st.subheader(f"1 · Cash-on-cash return{tax_tag} — expected value and range")
     for lab, s, r in zip(labels, sums, results):
-        cols = st.columns(5)
-        cols[0].metric(f"{lab} · mean avg CoC", pct(s["coc_mean"]))
-        cols[1].metric("10th–90th percentile",
-                       f"{pct(s['coc_p10'])} to {pct(s['coc_p90'])}")
-        cols[2].metric(f"Mean IRR{tax_tag}", pct(s["irr_mean"]))
-        cols[3].metric("IRR 10th–90th",
-                       f"{pct(s['irr_p10'])} to {pct(s['irr_p90'])}")
-        cols[4].metric("Cash invested", usd(s["cash_invested"]))
+        top = st.columns(3)
+        top[0].metric(f"{lab} · mean avg CoC", pct(s["coc_mean"]))
+        top[1].metric(f"Mean IRR{tax_tag}", pct(s["irr_mean"]))
+        top[2].metric("Cash invested", usd(s["cash_invested"]))
+        bot = st.columns(2)
+        bot[0].metric("CoC 10th–90th percentile",
+                      f"{pct(s['coc_p10'])} to {pct(s['coc_p90'])}")
+        bot[1].metric(f"IRR{tax_tag} 10th–90th percentile",
+                      f"{pct(s['irr_p10'])} to {pct(s['irr_p90'])}")
     pi_note = " · ".join(f"{l} {usd(s['monthly_payment'])}/mo"
                          for l, s in zip(labels, sums))
     st.caption(md(
@@ -890,12 +891,12 @@ def main():
         st.subheader(f"5 · Refinance at year {assume.refi_year}")
         for lab, r in zip(labels, results):
             cash_out = r["refi_cash"][:, assume.refi_year - 1]
-            e1, e2, e3 = st.columns(3)
+            e1, e3 = st.columns(2)
             e1.metric(f"{lab} · median cash out at refi", usd(np.median(cash_out)))
-            e2.metric("10th–90th percentile",
-                      f"{usd(np.percentile(cash_out, 10))} to "
-                      f"{usd(np.percentile(cash_out, 90))}")
             e3.metric("P(cash-in required)", pct(np.mean(cash_out < 0)))
+            st.metric("10th–90th percentile",
+                     f"{usd(np.percentile(cash_out, 10))} to "
+                     f"{usd(np.percentile(cash_out, 90))}")
         st.caption(f"New loan sized at {pct(assume.refi_ltv)} LTV against the "
                    f"simulated market value at year {assume.refi_year}, less the "
                    f"old balance and {pct(assume.refi_cost_pct)} closing costs. "
