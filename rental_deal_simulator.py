@@ -367,6 +367,69 @@ def md(s: str) -> str:
     return s.replace("$", "\\$")
 
 
+# ---------------------------------------------------------------- lead capture
+DEFAULT_LEAD_ENDPOINT = "https://www.namastebostonhomes.com/api/leads/rental-simulator"
+
+
+def _secret(name: str, default=None):
+    """Read a Streamlit secret without exploding when no secrets file exists
+    (the local/advisor case)."""
+    try:
+        import streamlit as st
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def lead_capture_enabled() -> bool:
+    """True only when an API key is configured — i.e. the deployed client-facing
+    app. Running locally there is no key, so the advisor gets the PDF directly
+    with no email gate."""
+    return bool(_secret("SIMULATOR_LEAD_API_KEY"))
+
+
+def deal_summary_line(res: dict) -> str:
+    """One-line headline of the run, written into the CRM note so the follow-up
+    call can open with the investor's own numbers."""
+    a = res["assumptions"]
+    s = summary_row(res)
+    tag = " after tax" if a.tax_enabled else ""
+    return (f"avg cash-on-cash{tag} {pct(s['coc_mean'])} "
+            f"({pct(s['coc_p10'])}–{pct(s['coc_p90'])}), "
+            f"{a.years}-yr IRR {pct(s['irr_mean'])}, "
+            f"P(positive CF) yr1 {pct(s['p_pos_y1'])} / yr5 {pct(s['p_pos_y5'])}, "
+            f"median yr-1 DSCR {ratio(s['dscr_median'])}")
+
+
+def submit_lead(name: str, email: str, phone: str, res: dict) -> tuple:
+    """POST the lead to Namaste Boston. Returns (ok, error_message).
+
+    Never raises — the caller must still hand over the PDF even if this fails.
+    """
+    key = _secret("SIMULATOR_LEAD_API_KEY")
+    if not key:
+        return False, "lead capture not configured"
+    endpoint = _secret("SIMULATOR_LEAD_ENDPOINT", DEFAULT_LEAD_ENDPOINT)
+    payload = {
+        "name": name,
+        "email": email,
+        "phone": phone or None,
+        "property": res["inputs"].address or res["inputs"].label,
+        "summary": deal_summary_line(res),
+        "purchasePrice": float(res["inputs"].purchase_price),
+        "monthlyRent": float(res["inputs"].monthly_rent),
+    }
+    try:
+        import requests
+        r = requests.post(endpoint, json=payload, timeout=8,
+                          headers={"Authorization": f"Bearer {key}"})
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}"
+        return True, ""
+    except Exception as exc:                                  # network, timeout
+        return False, str(exc)
+
+
 def summary_row(res: dict) -> dict:
     """Headline numbers for one deal — used by the UI and the PDF."""
     a = res["assumptions"]
@@ -931,15 +994,54 @@ def main():
                              for v in rows.values()],
             }).round(2), hide_index=True, width="stretch")
 
-    st.subheader("Client handout")
+    st.subheader("Get your one-page analysis")
     pdf_bytes = build_pdf(results, assume)
     fname = (results[0]["inputs"].address or "rental-deal").strip()
     fname = "".join(ch if ch.isalnum() or ch in "-_ " else "" for ch in fname)
     fname = (fname.replace(" ", "-").lower() or "rental-deal") + "-analysis.pdf"
-    st.download_button("Download one-page PDF summary", pdf_bytes, file_name=fname,
-                       mime="application/pdf", type="primary")
-    st.caption("Branded one-pager with the headline numbers, the probability chart, "
-               "the assumptions, and a disclaimer — ready to hand a client.")
+
+    def _offer_download():
+        st.download_button("Download one-page PDF summary", pdf_bytes,
+                           file_name=fname, mime="application/pdf",
+                           type="primary")
+        st.caption("Branded one-pager with the headline numbers, the probability "
+                   "chart, the assumptions, and a disclaimer.")
+
+    if not lead_capture_enabled() or st.session_state.get("lead_done"):
+        # advisor/local mode, or this visitor already gave their details
+        _offer_download()
+    else:
+        with st.form("lead_form"):
+            st.markdown("Enter your details and we'll prepare your PDF — plus a "
+                        "free follow-up call to walk through the numbers.")
+            f1, f2, f3 = st.columns(3)
+            lead_name = f1.text_input("Name*")
+            lead_email = f2.text_input("Email*")
+            lead_phone = f3.text_input("Phone (optional)")
+            agreed = st.checkbox(
+                "I'd like Namaste Boston Homes to follow up about this analysis.",
+                value=True)
+            submitted = st.form_submit_button("Get my PDF analysis",
+                                              type="primary")
+        if submitted:
+            if not lead_name.strip() or "@" not in lead_email:
+                st.error("Please enter your name and a valid email address.")
+            else:
+                ok, err = (submit_lead(lead_name.strip(), lead_email.strip(),
+                                       lead_phone.strip(), results[0])
+                           if agreed else (False, "opted out"))
+                # The PDF is the promise — hand it over regardless of CRM result.
+                st.session_state["lead_done"] = True
+                if ok:
+                    st.success("Thanks! Your PDF is ready below and we'll be in "
+                               "touch shortly.")
+                else:
+                    st.info("Your PDF is ready below.")
+                    if agreed:
+                        print(f"[lead] capture failed for {lead_email}: {err}")
+                _offer_download()
+        else:
+            st.caption("Namaste Boston Homes · we'll never share your details.")
 
     with st.expander("Model assumptions"):
         st.markdown(md(f"""
