@@ -880,6 +880,107 @@ def breakeven_price(row, rate: float = 0.0675, down_pct: float = 0.25,
     return lo
 
 
+def adu_panel(st, row, rank_table):
+    """Would adding a second unit fix a deal that does not work on one rent?
+
+    Massachusetts legalised accessory dwelling units by right in every
+    single-family zone in February 2025, and barred towns from requiring
+    owner-occupancy — so this is available to an investor, not just to a
+    homeowner. Almost nobody has re-underwritten for it.
+
+    The headline is that ADU economics run *opposite* to purchase economics.
+    Build cost barely varies across the state while rents vary enormously, so
+    the towns worth buying cheaply are the worst places to add a unit, and the
+    expensive suburbs are the best.
+    """
+    import adu
+
+    st.markdown("##### Add a second unit")
+    st.caption("Since February 2025 a single accessory dwelling unit is "
+               "allowed by right on any single-family lot in Massachusetts, "
+               "and towns may not require you to live there. Two rents change "
+               "the arithmetic that one rent could not.")
+
+    c1, c2, c3 = st.columns(3)
+    house_sqft = c1.number_input("Size of the house (sq ft)", 600, 8_000, 1_800,
+                                 step=100,
+                                 help="The legal cap is the smaller of 900 sq "
+                                      "ft and half the house, so a full-size "
+                                      "unit needs 1,800 sq ft or more.")
+    route = c2.selectbox("How you'd build it", list(adu.BUILD_COSTS))
+    financed = c3.slider("Share of the build you'd borrow (%)", 0, 100, 80,
+                         step=10) / 100
+
+    plan = adu.plan_for(float(house_sqft), route, financed_pct=financed)
+    if plan.adu_sqft <= 0:
+        st.warning("That house is too small to carry a legal unit.")
+        return
+
+    be = adu.breakeven_rent(plan)
+    town_rent = float(row["market_rent"])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Largest legal unit", f"{plan.adu_sqft:,.0f} sq ft")
+    m2.metric("Cost to build", usd(plan.build_cost),
+              f"{usd(plan.build_cost - plan.build_cost*financed)} of your cash",
+              delta_color="off")
+    m3.metric("Rent it must clear", usd(be) + "/mo",
+              f"{be/town_rent*100:.0f}% of the town's typical rent",
+              delta_color="off")
+
+    margin = town_rent / be if be else 0
+    if margin >= 1.6:
+        st.success(md(
+            f"Comfortable. The unit only has to clear {usd(be)} against a town "
+            f"typical of {usd(town_rent)} — it could rent {(1-be/town_rent)*100:.0f}% "
+            f"under the going rate and still wash its face. This is the shape "
+            f"of deal worth pursuing."))
+    elif margin >= 1.15:
+        st.info(md(
+            f"Workable but not generous. It needs {usd(be)} against a town "
+            f"typical of {usd(town_rent)}. Get real rental comps for a unit "
+            f"this size before committing."))
+    else:
+        st.warning(md(
+            f"Thin. It needs {usd(be)} and the town's typical rent is only "
+            f"{usd(town_rent)} — a smaller unit will not beat the typical "
+            f"home's rent, so there is no margin here. Build cost barely "
+            f"varies across Massachusetts while rents do, which is why cheap "
+            f"towns are poor places to add a unit."))
+
+    with st.expander("Best towns in Massachusetts for adding a unit"):
+        st.caption("Ranked by how far the town's typical rent sits above the "
+                   "rent the unit must clear. This deliberately ignores house "
+                   "prices — the build costs the same either way, so what "
+                   "matters is the rent it can command. Every town with a rent "
+                   "figure is included: the confidence gate on the buying "
+                   "table measures coverage of the four purchase signals, "
+                   "which say nothing about whether a unit here would let.")
+        rank = rank_table.copy()
+        rank["needed"] = be
+        rank["margin"] = rank["market_rent"] / be
+        rank = rank.sort_values("margin", ascending=False).head(15)
+        rank["Cushion"] = ((rank["margin"] - 1) * 100).round(0)
+        st.dataframe(
+            rank[["town", "county", "market_rent", "needed", "Cushion"]].rename(
+                columns={"town": "Town", "county": "County",
+                         "market_rent": "Typical rent",
+                         "needed": "Unit must clear"}),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Typical rent": st.column_config.NumberColumn(format="$%d"),
+                "Unit must clear": st.column_config.NumberColumn(format="$%d"),
+                "Cushion": st.column_config.NumberColumn(
+                    format="%+.0f%%",
+                    help="How far above the required rent the town's typical "
+                         "rent sits."),
+            })
+
+    st.caption("Towns still control height, setbacks, lot coverage, historic "
+               "districts and design review, so confirm the bylaw and the lot "
+               "before spending anything. Not legal advice.")
+
+
 def where_to_buy(st, alt):
     """Rank Massachusetts towns, then hand the winner to the underwriter.
 
@@ -1014,6 +1115,9 @@ def where_to_buy(st, alt):
                     f"rental here — anything above it you are betting on price "
                     f"growth, not rent. Distressed sales, estates and "
                     f"long-sitting listings are where that number lives."))
+
+    # Statewide and ungated on purpose — see the note inside the panel.
+    adu_panel(st, row, _screen("", None, 0.0))
 
     if st.button(f"Underwrite {pick} in Deal A", type="primary"):
         st.session_state["a_addr"] = f"{pick}, MA (typical home)"
