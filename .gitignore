@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 .claude/
+
+# Downloaded market data — regenerate with `python3 market_data.py`.
+# Kept out of git so the repo never carries a stale snapshot of the market.
+data/market/
+

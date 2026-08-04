@@ -18,6 +18,7 @@ Every real deal should be reviewed by a CPA.
 """
 
 import io
+import os
 from dataclasses import dataclass, field, replace
 from datetime import date
 
@@ -788,6 +789,253 @@ def by_year_chart(frames: list, value_col: str, title: str, y_title: str, alt,
     )
 
 
+# ---------------------------------------------------------------- where to buy
+# Rough statewide stand-ins, used only for the reality-check sentence. Real
+# deals must use the real figures off the listing.
+MA_TYPICAL_TAX_RATE = 0.011        # residential, share of value per year
+MA_TYPICAL_INSURANCE_RATE = 0.005
+
+
+def reality_check(row, rate: float = 0.0675, down_pct: float = 0.25):
+    """Does the typical home in this town actually cash flow?
+
+    Ranking towns against each other says which is *least bad*, and that is
+    easy to misread as "buy here". So the top of the list gets run through the
+    real underwriter at the town's own typical price and rent, and the answer
+    is stated plainly either way.
+
+    Returns (first-year monthly cash flow, sentence), or None if the town is
+    missing the figures needed.
+    """
+    if pd.isna(row.get("home_value")) or pd.isna(row.get("market_rent")):
+        return None
+
+    price = float(row["home_value"])
+    deal = DealInputs(
+        label="check", purchase_price=price, down_payment_pct=down_pct,
+        rate=rate, monthly_rent=float(row["market_rent"]),
+        taxes_annual=price * MA_TYPICAL_TAX_RATE,
+        insurance_annual=price * MA_TYPICAL_INSURANCE_RATE)
+
+    res = run_simulation(deal, Assumptions(years=5, n_trials=400, seed=7))
+    monthly = float(np.median(res["annual_cf"][:, 0])) / 12.0
+
+    town = row["town"]
+    if monthly > 0:
+        return monthly, (
+            f"Reality check — a typical {town} home at {usd(price)} renting for "
+            f"{usd(row['market_rent'])} clears about {usd(monthly)} a month "
+            f"after the mortgage and costs, with {int(down_pct*100)}% down at "
+            f"{pct(rate)}. One unit, statewide-average taxes and insurance.")
+
+    return monthly, (
+        f"Reality check — a typical {town} home at {usd(price)} renting for "
+        f"{usd(row['market_rent'])} does **not** cash flow: about "
+        f"{usd(abs(monthly))} a month out of your pocket, with "
+        f"{int(down_pct*100)}% down at {pct(rate)}. That is one unit at the "
+        f"town's typical price. Ranking high here means *relatively* better "
+        f"than the rest of Massachusetts, not that the average house is a buy. "
+        f"Making it work needs a below-average price, more than one rent, or "
+        f"both — which is the case for most of this list at today's rates.")
+
+
+def breakeven_price(row, rate: float = 0.0675, down_pct: float = 0.25,
+                    tol: float = 500.0):
+    """The most you could pay here and still break even in year one.
+
+    "This town doesn't cash flow" is a complaint. "Anything over $X doesn't
+    cash flow here" is an offer strategy — it turns the screen into a number
+    you can walk into a negotiation with.
+
+    Cash flow falls monotonically as price rises (mortgage, taxes and
+    insurance all scale with it), so a bisection is safe. Returns the price,
+    or None if even a very low price cannot clear the rent.
+    """
+    if pd.isna(row.get("home_value")) or pd.isna(row.get("market_rent")):
+        return None
+
+    rent = float(row["market_rent"])
+    a = Assumptions(years=3, n_trials=200, seed=11)
+
+    def cash_at(price: float) -> float:
+        deal = DealInputs(
+            purchase_price=price, down_payment_pct=down_pct, rate=rate,
+            monthly_rent=rent,
+            taxes_annual=price * MA_TYPICAL_TAX_RATE,
+            insurance_annual=price * MA_TYPICAL_INSURANCE_RATE)
+        return float(np.median(run_simulation(deal, a)["annual_cf"][:, 0]))
+
+    lo, hi = 50_000.0, float(row["home_value"])
+    if cash_at(lo) <= 0:
+        return None                      # rent cannot carry even a cheap house
+    if cash_at(hi) > 0:
+        return hi                        # already works at the typical price
+
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        if cash_at(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def where_to_buy(st, alt):
+    """Rank Massachusetts towns, then hand the winner to the underwriter.
+
+    The simulator answers "is this house a good buy". It cannot tell you which
+    town to look in, which is the question that comes first. This closes that
+    gap: real home values and real market rents for every MA town, ranked, and
+    a button that loads the chosen town's numbers into Deal A.
+    """
+    # Not `as md` — that is already the markdown-escape helper in this module.
+    import market_data as mkt
+    import town_screener as ts
+
+    st.subheader("Where to buy")
+    st.caption("Every Massachusetts town ranked on how much rent you get per "
+               "dollar of price, whether that is improving, how fast rents are "
+               "rising, and how much room there is to negotiate. Free public "
+               "data — no MLS feed needed.")
+
+    have_data = all(os.path.exists(mkt._cache_path(n)) for n in mkt.SOURCES)
+    if not have_data:
+        st.info("Market data has not been downloaded yet — about 15 seconds, "
+                "then it is cached on disk.")
+        if st.button("Download Massachusetts market data"):
+            with st.spinner("Downloading home values and market rents…"):
+                mkt.refresh_all()
+            st.rerun()
+        return
+
+    @st.cache_data(show_spinner=False)
+    def _screen(county, min_yield, min_conf):
+        return ts.screen(county=county or None, min_rent_yield=min_yield,
+                         min_confidence=min_conf)
+
+    counties = ["All Massachusetts"] + sorted(
+        ts.build_table()["county"].dropna().unique().tolist())
+
+    c1, c2, c3 = st.columns(3)
+    county = c1.selectbox("County", counties)
+    min_yield = c2.slider("Least rent yield I'd accept (%)", 0.0, 12.0, 0.0,
+                          step=0.5,
+                          help="A year of rent divided by the price, before "
+                               "any costs. Leave at 0 to see everything.") / 100
+    thin = c3.toggle("Include towns with patchy data", value=False,
+                     help="Some small towns only have one or two of the four "
+                          "measures. They are hidden by default because one "
+                          "good number is easy to mistake for a good town.")
+
+    table = _screen("" if county == "All Massachusetts" else county,
+                    min_yield, 0.0 if thin else 0.6)
+    if table.empty:
+        st.warning("No towns match those filters.")
+        return
+
+    st.caption(md(f"**{len(table)} towns** · data through "
+                       f"{table['month'].iloc[0]}"))
+
+    show = table.head(25).copy()
+    show["Rent yield"] = (show["rent_yield"] * 100).round(1)
+    show["Rent growth (1yr)"] = (show["rent_yoy"] * 100).round(1)
+    show["Price change (1yr)"] = (show["price_yoy"] * 100).round(1)
+    show["Yield vs 3yr ago"] = (show["yield_trend"] * 100).round(2)
+    st.dataframe(
+        show[["town", "county", "home_value", "market_rent", "Rent yield",
+              "Yield vs 3yr ago", "Rent growth (1yr)", "Price change (1yr)",
+              "days_pending", "score"]].rename(columns={
+                  "town": "Town", "county": "County",
+                  "home_value": "Typical home value",
+                  "market_rent": "Typical rent",
+                  "days_pending": "Days to go under agreement",
+                  "score": "Score"}),
+        hide_index=True, use_container_width=True,
+        column_config={
+            "Typical home value": st.column_config.NumberColumn(format="$%d"),
+            "Typical rent": st.column_config.NumberColumn(format="$%d"),
+            "Rent yield": st.column_config.NumberColumn(format="%.1f%%"),
+            "Yield vs 3yr ago": st.column_config.NumberColumn(format="%+.2f pts"),
+            "Rent growth (1yr)": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Price change (1yr)": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=100,
+                                                     format="%.0f"),
+        })
+
+    pick = st.selectbox("Look closer at", table["town"].tolist())
+    row = table[table["town"] == pick].iloc[0]
+
+    st.info(md(row["read"]))
+
+    m = st.columns(4)
+    m[0].metric("Typical home value", usd(row["home_value"]))
+    m[1].metric("Typical rent", usd(row["market_rent"]) + "/mo")
+    m[2].metric("Rent yield", pct(row["rent_yield"]))
+    m[3].metric("Rent growth, past year",
+                "—" if pd.isna(row["rent_yoy"]) else pct(row["rent_yoy"]))
+
+    hist = ts.yield_history(pick, months=60)
+    if len(hist) > 2:
+        chart_df = hist.copy()
+        chart_df["Rent yield (%)"] = chart_df["rent_yield"] * 100
+        # Single layer on purpose — layered charts lose their marks on rerun.
+        st.altair_chart(
+            alt.Chart(chart_df).mark_line(color=BLUE, strokeWidth=2.5).encode(
+                x=alt.X("month:T", title=None),
+                y=alt.Y("Rent yield (%):Q", title="Rent yield (%)",
+                        scale=alt.Scale(zero=False)),
+                tooltip=[alt.Tooltip("month:T", title="Month"),
+                         alt.Tooltip("Rent yield (%):Q", format=".2f")],
+            ).properties(height=220,
+                         title=f"{pick} — rent yield over time"),
+            use_container_width=True)
+        st.caption("Rising line means prices have fallen behind rents, which "
+                   "is when a town gets interesting to a landlord.")
+
+    # ---- reality check: rank order is not the same thing as a good deal.
+    check = reality_check(row)
+    if check is not None:
+        cash, verdict = check
+        (st.success if cash > 0 else st.warning)(md(verdict))
+
+        if cash <= 0:
+            be = breakeven_price(row)
+            if be is None:
+                st.caption("At this rent, no purchase price in a sane range "
+                           "breaks even — the rent itself is the problem here.")
+            else:
+                gap = be / float(row["home_value"]) - 1
+                st.metric(f"What you'd have to pay in {pick} to break even",
+                          usd(be), f"{gap*100:.0f}% vs typical",
+                          delta_color="off")
+                st.caption(md(
+                    f"Buy at {usd(be)} or below and the first year carries "
+                    f"itself. That is your offer ceiling for a single-unit "
+                    f"rental here — anything above it you are betting on price "
+                    f"growth, not rent. Distressed sales, estates and "
+                    f"long-sitting listings are where that number lives."))
+
+    if st.button(f"Underwrite {pick} in Deal A", type="primary"):
+        st.session_state["a_addr"] = f"{pick}, MA (typical home)"
+        st.session_state["a_price"] = int(round(row["home_value"], -3))
+        st.session_state["a_rent"] = int(round(row["market_rent"], -1))
+        st.session_state["_town_loaded"] = pick
+        st.rerun()
+
+    if st.session_state.get("_town_loaded"):
+        st.success(md(
+            f"Deal A now holds the typical home value and rent for "
+            f"**{st.session_state['_town_loaded']}**. Set the property taxes, "
+            f"insurance and HOA from the actual listing before you trust the "
+            f"result — Massachusetts tax rates vary by more than double "
+            f"between towns, which is often the whole margin."))
+
+    st.caption("These are town-wide typical figures, and the yield is gross — "
+               "no taxes, insurance, vacancy or management. Use them to pick "
+               "where to look, then underwrite the real listing below.")
+    st.divider()
+
+
 # ---------------------------------------------------------------- UI
 DEFAULT_B = DealInputs(label="Deal B", purchase_price=730_000.0,
                        monthly_rent=5_200.0, taxes_annual=8_000.0)
@@ -839,6 +1087,9 @@ def main():
     st.title("Rental Deal Simulator")
     st.caption("Monte Carlo underwriting — distributions, not single numbers. "
                "Namaste Boston Homes.")
+
+    with st.expander("Where to buy — rank Massachusetts towns", expanded=False):
+        where_to_buy(st, alt)
 
     with st.sidebar:
         compare = st.toggle("Compare two deals", value=False)
