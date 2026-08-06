@@ -13,8 +13,15 @@ trials) and importable without Streamlit for testing:
 v2 features: stochastic appreciation, after-tax returns, two-deal compare,
 DSCR lender view, mid-hold refinance, and branded PDF export.
 
+v3: a real DSCR loan (dscr.py) — sizes the loan itself from a program's rate,
+LTV and minimum DSCR, rather than only grading a manually-entered down
+payment. See DSCR_PLAYBOOK.md for why the lender's DSCR convention and the
+investor's disagree, and how much that gap matters.
+
 NOT TAX ADVICE. The tax layer is a simplified model for screening deals.
-Every real deal should be reviewed by a CPA.
+NOT A LOAN QUOTE. DSCR programs are editable market-standard tiers, not a
+real term sheet — every real deal should be reviewed by a CPA and priced by
+an actual lender.
 """
 
 import io
@@ -89,27 +96,47 @@ class Assumptions:
     refi_ltv: float = 0.75
     refi_cost_pct: float = 0.02         # closing costs as % of new loan
 
-    # DSCR lender view
+    # DSCR lender view (investor-convention diagnostic, always computed)
     dscr_thresholds: tuple = (1.15, 1.25)
+
+    # DSCR loan (opt-in): when enabled, `dscr_program` sizes the loan itself —
+    # rate, LTV, interest-only and points all come from the program, and
+    # inp.rate / inp.down_payment_pct / inp.term_years are ignored for the
+    # purchase loan. Off by default so existing behaviour, and every
+    # previously-quoted number, is unchanged unless a client opts in.
+    dscr_loan_enabled: bool = False
+    dscr_program: "dscr.DscrProgram | None" = None
 
 
 # ---------------------------------------------------------------- core math
+def _level_payment(loan, r, n_periods):
+    """Level payment amortizing `loan` to zero over `n_periods` months at
+    monthly rate `r`. Shared by monthly_payment() and the amortizing phase of
+    amortize()."""
+    if n_periods <= 0:
+        return np.zeros_like(loan)
+    if r == 0:
+        return loan / n_periods
+    return loan * r / (1 - (1 + r) ** -n_periods)
+
+
 def monthly_payment(loan, rate: float, term_years: int):
     """Level P&I payment. `loan` may be a scalar or an array."""
     loan = np.asarray(loan, dtype=float)
-    n = term_years * 12
-    r = rate / 12
-    if r == 0:
-        pmt = loan / n
-    else:
-        pmt = loan * r / (1 - (1 + r) ** -n)
+    pmt = _level_payment(loan, rate / 12, term_years * 12)
     return np.where(loan > 0, pmt, 0.0)
 
 
-def amortize(loan, rate: float, term_years: int, n_months: int):
-    """Vectorized amortization.
+def amortize(loan, rate: float, term_years: int, n_months: int, io_months: int = 0):
+    """Vectorized amortization, with an optional interest-only period.
 
-    `loan` is a scalar or (n_trials,) array. Returns:
+    `loan` is a scalar or (n_trials,) array. `io_months` is how many months at
+    the start pay interest only — the balance stays flat, then the loan
+    amortizes over the remaining term (`term_years * 12 - io_months` months).
+    A DSCR loan with `io_months=0` behaves exactly as before this parameter
+    existed, so every existing caller is unaffected.
+
+    Returns:
       payment  (n, n_months) — 0 once the loan is retired
       interest (n, n_months)
       balance  (n,)          — remaining balance after n_months payments
@@ -117,23 +144,43 @@ def amortize(loan, rate: float, term_years: int, n_months: int):
     loan = np.atleast_1d(np.asarray(loan, dtype=float)).reshape(-1, 1)
     r = rate / 12
     n_term = term_years * 12
-    pmt = monthly_payment(loan, rate, term_years)          # (n, 1)
+    io_months = int(np.clip(io_months, 0, n_term))
+    amort_periods = n_term - io_months
+
     m = np.arange(n_months)[None, :]                       # (1, n_months)
+    in_io = m < io_months
+    m2 = np.clip(m - io_months, 0, None)                   # months into the amortizing phase
 
+    # ---- interest-only phase: flat balance, payment == interest
+    interest_io = (loan * r) * in_io
+    payment_io = interest_io
+
+    # ---- amortizing phase, on the (unpaid-down) balance left after IO
+    pmt2 = _level_payment(loan, r, amort_periods)          # (n, 1)
     if r == 0:
-        bal = loan - pmt * m
-        interest = np.zeros((loan.shape[0], n_months))
-        bal_end = loan[:, 0] - pmt[:, 0] * min(n_months, n_term)
+        bal2 = loan - pmt2 * m2
+        interest2 = np.zeros_like(bal2)
     else:
-        grow = (1 + r) ** m
-        bal = loan * grow - pmt * (grow - 1) / r           # balance before pmt m+1
-        interest = np.maximum(bal, 0.0) * r
-        g_end = (1 + r) ** min(n_months, n_term)
-        bal_end = loan[:, 0] * g_end - pmt[:, 0] * (g_end - 1) / r
+        grow2 = (1 + r) ** m2
+        bal2 = loan * grow2 - pmt2 * (grow2 - 1) / r       # balance before pmt m2+1
+        interest2 = np.maximum(bal2, 0.0) * r
+    in_amort = (~in_io) & (m < n_term) & (bal2 > 1e-6)
+    payment2 = np.where(in_amort, np.broadcast_to(pmt2, interest2.shape), 0.0)
+    interest2 = np.where(in_amort, interest2, 0.0)
 
-    active = (m < n_term) & (bal > 1e-6)
-    payment = np.where(active, pmt, 0.0)
-    interest = np.where(active, interest, 0.0)
+    payment = payment_io + payment2
+    interest = interest_io + interest2
+
+    months_end = min(n_months, n_term)
+    if months_end <= io_months:
+        bal_end = loan[:, 0]
+    else:
+        m2_end = months_end - io_months
+        if r == 0:
+            bal_end = loan[:, 0] - pmt2[:, 0] * m2_end
+        else:
+            g_end = (1 + r) ** m2_end
+            bal_end = loan[:, 0] * g_end - pmt2[:, 0] * (g_end - 1) / r
     return payment, interest, np.maximum(bal_end, 0.0)
 
 
@@ -170,13 +217,31 @@ def _depreciation_by_year(building_basis: float, years: int) -> np.ndarray:
 
 def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
     """Vectorized Monte Carlo over `a.n_trials` trials. Returns arrays by metric."""
+    import dscr as dscr_mod
+
     a = a or Assumptions()
     rng = np.random.default_rng(a.seed)
     years, n = int(a.years), int(a.n_trials)
     months = years * 12
 
-    cash_invested = inp.purchase_price * inp.down_payment_pct
-    loan0 = inp.purchase_price - cash_invested
+    # ---- the loan: manual terms, or a DSCR program that sizes it itself
+    dscr_sizing = None
+    io_months = 0
+    if a.dscr_loan_enabled and a.dscr_program is not None:
+        dscr_sizing = dscr_mod.max_loan(
+            inp.purchase_price, inp.monthly_rent, inp.taxes_annual,
+            inp.insurance_annual, a.dscr_program, inp.hoa_monthly)
+        loan0 = dscr_sizing["loan"]
+        cash_invested = dscr_sizing["cash_to_close"]
+        loan_rate = a.dscr_program.rate
+        loan_term_years = a.dscr_program.term_years
+        if a.dscr_program.interest_only:
+            io_months = a.dscr_program.io_years * 12
+    else:
+        cash_invested = inp.purchase_price * inp.down_payment_pct
+        loan0 = inp.purchase_price - cash_invested
+        loan_rate = inp.rate
+        loan_term_years = inp.term_years
 
     # ---- stochastic property value (drawn first so the same seed gives the
     # same appreciation path across deals — a paired A/B comparison)
@@ -199,26 +264,37 @@ def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
     fixed_m = ((inp.taxes_annual + inp.insurance_annual) / 12 + inp.hoa_monthly) \
         * (1 + EXPENSE_INFLATION) ** year_idx                            # (months,)
 
-    # NOI excludes debt service and big repairs (lender convention for DSCR)
+    # NOI excludes debt service and big repairs — this is the investor-
+    # convention DSCR input below. The lender-convention DSCR (further down)
+    # uses gross scheduled rent over PITIA instead; see dscr.py for why the
+    # two disagree and which one a real lender actually underwrites on.
     noi_m = collected - mgmt - maint - fixed_m
     noi = noi_m.reshape(n, years, 12).sum(axis=2)                        # (n, years)
 
     # ---- debt: original loan, optionally refinanced at year N
-    payment, interest, _ = amortize(np.full(n, loan0), inp.rate,
-                                    inp.term_years, months)
+    payment, interest, _ = amortize(np.full(n, loan0), loan_rate,
+                                    loan_term_years, months, io_months)
     refi_cash = np.zeros((n, years))
     refi_month = None
 
     if a.refi_enabled and 0 < a.refi_year < years and loan0 > 0:
         refi_month = int(a.refi_year) * 12
         # balance at the refi date under the original loan
-        _, _, bal_at_refi = amortize(np.full(n, loan0), inp.rate,
-                                     inp.term_years, refi_month)
+        _, _, bal_at_refi = amortize(np.full(n, loan0), loan_rate,
+                                     loan_term_years, refi_month, io_months)
         value_at_refi = value_by_year[:, int(a.refi_year) - 1]
         new_loan = a.refi_ltv * value_at_refi
         costs = a.refi_cost_pct * new_loan
+        # a DSCR loan's own prepayment penalty (5/4/3/2/1 by default) is real
+        # money the investor gives up to refinance early — netted out of the
+        # cash pulled, not treated as free
+        if a.dscr_loan_enabled and a.dscr_program is not None:
+            penalty = dscr_mod.prepay_penalty(bal_at_refi, int(a.refi_year),
+                                              a.dscr_program)
+        else:
+            penalty = 0.0
         # cash pulled out (negative = cash the investor must bring to close)
-        refi_cash[:, int(a.refi_year) - 1] = new_loan - bal_at_refi - costs
+        refi_cash[:, int(a.refi_year) - 1] = new_loan - bal_at_refi - costs - penalty
 
         pay2, int2, _ = amortize(new_loan, a.refi_rate, a.refi_term_years,
                                  months - refi_month)
@@ -227,8 +303,8 @@ def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
         _, _, bal_end = amortize(new_loan, a.refi_rate, a.refi_term_years,
                                  months - refi_month)
     else:
-        _, _, bal_end = amortize(np.full(n, loan0), inp.rate,
-                                 inp.term_years, months)
+        _, _, bal_end = amortize(np.full(n, loan0), loan_rate,
+                                 loan_term_years, months, io_months)
 
     debt_service = payment.reshape(n, years, 12).sum(axis=2)             # (n, years)
     interest_yr = interest.reshape(n, years, 12).sum(axis=2)
@@ -242,9 +318,20 @@ def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
     # distort cash-on-cash; they enter the IRR flows below)
     annual_cf = noi - debt_service - repair_cost                         # (n, years)
 
-    # ---- DSCR (lender view): NOI over debt service
+    # ---- DSCR, investor convention: NOI (net of vacancy, management,
+    # maintenance) over debt service. The stricter, all-in test.
     with np.errstate(divide="ignore", invalid="ignore"):
         dscr = np.where(debt_service > 0, noi / debt_service, np.inf)
+
+    # ---- DSCR, lender convention: gross scheduled rent over PITIA. This is
+    # what a DSCR-loan underwriter actually computes, and it reads higher
+    # than the investor number above because it doesn't net out vacancy,
+    # management or maintenance first.
+    rent_annual = sched_rent_m.reshape(n, years, 12).sum(axis=2)          # (n, years)
+    fixed_annual = fixed_m.reshape(years, 12).sum(axis=1)                 # (years,)
+    pitia = debt_service + fixed_annual[None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dscr_lender = np.where(pitia > 0, rent_annual / pitia, np.inf)
 
     # ---- exit
     gross_sale = value_by_year[:, -1]
@@ -311,6 +398,8 @@ def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
         "irr_after_tax": _irr(after_tax_cf, equity_after_tax),
         "p_positive": p_positive,
         "dscr": dscr,
+        "dscr_lender": dscr_lender,
+        "dscr_sizing": dscr_sizing,
         "noi": noi,
         "debt_service": debt_service,
         "value_by_year": value_by_year,
@@ -319,20 +408,38 @@ def run_simulation(inp: DealInputs, a: Assumptions = None) -> dict:
         "tax_by_year": tax_by_year,
         "sale_tax": sale_tax,
         "cash_invested": cash_invested,
-        "monthly_payment": float(monthly_payment(loan0, inp.rate, inp.term_years)),
+        "monthly_payment": (dscr_sizing["monthly_pi"] if dscr_sizing
+                           else float(monthly_payment(loan0, inp.rate, inp.term_years))),
         "loan0": loan0,
+        "loan_rate": loan_rate,
+        "io_months": io_months,
         "refi_month": refi_month,
         "depreciation_annual": float(dep_by_year[0]) if len(dep_by_year) else 0.0,
     }
 
 
 def bad_luck_year1(inp: DealInputs, vacant_months: int = 3,
-                   repair_cost: float = 12_500.0) -> dict:
+                   repair_cost: float = 12_500.0, a: Assumptions = None) -> dict:
     """Deterministic stress: `vacant_months` empty + one big repair in year 1,
-    vs. the expected year 1 (vacancy % applied evenly, no repair)."""
-    cash = inp.purchase_price * inp.down_payment_pct
-    loan = inp.purchase_price - cash
-    pmt = float(monthly_payment(loan, inp.rate, inp.term_years))
+    vs. the expected year 1 (vacancy % applied evenly, no repair).
+
+    Pass `a` when a DSCR loan is in play so year 1's payment reflects the
+    program's own rate, interest-only period and sizing rather than `inp`'s
+    manual terms — otherwise this stress test would quote a loan the deal
+    isn't actually using."""
+    if a is not None and a.dscr_loan_enabled and a.dscr_program is not None:
+        import dscr as dscr_mod
+        sizing = dscr_mod.max_loan(inp.purchase_price, inp.monthly_rent,
+                                   inp.taxes_annual, inp.insurance_annual,
+                                   a.dscr_program, inp.hoa_monthly)
+        loan = sizing["loan"]
+        rate, term = a.dscr_program.rate, a.dscr_program.term_years
+        io = a.dscr_program.io_years * 12 if a.dscr_program.interest_only else 0
+        pmt = loan * rate / 12 if io > 0 else float(monthly_payment(loan, rate, term))
+    else:
+        cash = inp.purchase_price * inp.down_payment_pct
+        loan = inp.purchase_price - cash
+        pmt = float(monthly_payment(loan, inp.rate, inp.term_years))
     fixed = inp.taxes_annual + inp.insurance_annual + 12 * inp.hoa_monthly
     sched = 12 * inp.monthly_rent
 
@@ -437,6 +544,7 @@ def summary_row(res: dict) -> dict:
     irr = res["irr_after_tax"] if a.tax_enabled else res["irr"]
     coc = res["avg_coc_after_tax"] if a.tax_enabled else res["avg_coc"]
     d1 = res["dscr"][:, 0]
+    dl1 = res["dscr_lender"][:, 0]
     return {
         "coc_mean": float(np.mean(coc)),
         "coc_p10": float(np.percentile(coc, 10)),
@@ -446,9 +554,17 @@ def summary_row(res: dict) -> dict:
         "irr_p90": float(np.nanpercentile(irr, 90)),
         "p_pos_y1": float(res["p_positive"][0]),
         "p_pos_y5": float(res["p_positive"][min(4, a.years - 1)]),
+        # investor convention — NOI (net of vacancy/mgmt/maintenance) / P&I.
+        # The stricter, all-in test.
         "dscr_median": float(np.median(d1[np.isfinite(d1)])) if np.isfinite(d1).any() else np.inf,
         "dscr_pass_115": float(np.mean(d1 >= 1.15)),
         "dscr_pass_125": float(np.mean(d1 >= 1.25)),
+        # lender convention — gross scheduled rent / PITIA. What a DSCR-loan
+        # underwriter actually computes; reads higher than the investor number.
+        "dscr_lender_median": float(np.median(dl1[np.isfinite(dl1)])) if np.isfinite(dl1).any() else np.inf,
+        "dscr_lender_pass_100": float(np.mean(dl1 >= 1.00)),
+        "dscr_lender_pass_115": float(np.mean(dl1 >= 1.15)),
+        "dscr_lender_pass_125": float(np.mean(dl1 >= 1.25)),
         "cash_invested": res["cash_invested"],
         "monthly_payment": res["monthly_payment"],
         "worst_year_p10": float(np.percentile(res["annual_cf"].min(axis=1), 10)),
@@ -466,7 +582,8 @@ def plain_verdict(res: dict) -> str:
     cash = s["cash_invested"]
     typical_dollars = s["coc_mean"] * cash
     yr1, yr5 = s["p_pos_y1"], s["p_pos_y5"]
-    dscr = s["dscr_median"]
+    dscr = s["dscr_lender_median"]
+    dscr_investor = s["dscr_median"]
 
     # money in, money out
     if s["coc_mean"] >= 0:
@@ -512,23 +629,36 @@ def plain_verdict(res: dict) -> str:
     line4 = (f"Held {a.years} years and sold, the whole investment averages "
              f"{pct(irr)} a year. {source}")
 
-    # lender view
+    # lender view — DSCR lenders qualify on gross rent over PITIA, which reads
+    # higher than the investor's own net-of-expenses test above. Lead with the
+    # number the lender actually computes, and name the stricter one alongside
+    # it so a comfortable lender verdict doesn't get mistaken for a comfortable
+    # deal.
+    investor_note = (f" By the stricter, all-in test — rent net of vacancy, "
+                     f"management and maintenance against principal and "
+                     f"interest alone — it's {ratio(dscr_investor)}."
+                     if np.isfinite(dscr_investor) else "")
     if not np.isfinite(dscr):
         line5 = "With no mortgage, lender coverage rules don't apply here."
     elif dscr >= 1.25:
-        line5 = (f"A rental-loan lender would be comfortable: the rent covers the "
-                 f"mortgage {ratio(dscr)} over, above the usual 1.25 bar.")
+        line5 = (f"A DSCR lender would be comfortable: gross rent covers the "
+                 f"mortgage, taxes and insurance {ratio(dscr)} over, above the "
+                 f"usual 1.25 bar.{investor_note}")
     elif dscr >= 1.15:
-        line5 = (f"A rental-loan lender would be borderline: rent covers the "
-                 f"mortgage {ratio(dscr)} over — enough for a lenient lender "
-                 f"(1.15), short of a strict one (1.25).")
+        line5 = (f"A DSCR lender would be borderline: gross rent covers "
+                 f"{ratio(dscr)} — enough for a lenient program (1.15), short "
+                 f"of a strict one (1.25).{investor_note}")
+    elif dscr >= 1.00:
+        line5 = (f"Only a max-leverage DSCR program (1.00 floor) would fund "
+                 f"this as it stands: gross rent covers {ratio(dscr)} of the "
+                 f"mortgage, taxes and insurance.{investor_note}")
     else:
-        line5 = (f"Most rental-loan lenders would decline this as it stands: rent "
-                 f"only covers {ratio(dscr)} of the mortgage, under the 1.15 "
-                 f"minimum. You'd need more money down, a lower price, or "
-                 f"higher rent.")
+        line5 = (f"Most DSCR lenders would decline this as it stands: gross "
+                 f"rent only covers {ratio(dscr)}, under the 1.00 floor. "
+                 f"You'd need more money down, a lower price, or higher "
+                 f"rent.{investor_note}")
 
-    stress = bad_luck_year1(inp)
+    stress = bad_luck_year1(inp, a=a)
     line6 = (f"If you hit a rough patch — three empty months and a big repair in "
              f"the same year — that year costs you about "
              f"{usd(abs(stress['delta']))} more than a normal one. Worth keeping "
@@ -1186,6 +1316,8 @@ def main():
     import altair as alt
     import streamlit as st
 
+    import dscr
+
     st.set_page_config(page_title="Rental Deal Simulator", page_icon="🏠",
                        layout="wide")
     st.title("Rental Deal Simulator")
@@ -1240,6 +1372,45 @@ def main():
             refi_cost = st.number_input("Refi closing costs (% of loan)", 0.0, 6.0,
                                         2.0, step=0.25, disabled=not refi_on)
 
+            st.markdown("**DSCR loan**")
+            st.caption("A rental-property lender qualifies you on gross rent "
+                       "over PITIA, not on down payment. Turn this on to let "
+                       "the program size the loan — rate, leverage, "
+                       "interest-only and points all come from it, and the "
+                       "manual rate / down payment / term above are ignored "
+                       "for the purchase loan.")
+            dscr_on = st.toggle("Finance with a DSCR loan", value=False)
+            tier_names = [p.name for p in dscr.DEFAULT_PROGRAMS]
+            tier_pick = st.selectbox("Program tier", tier_names, index=1,
+                                     disabled=not dscr_on)
+            base_program = next(p for p in dscr.DEFAULT_PROGRAMS
+                                if p.name == tier_pick)
+            with st.expander("Edit program terms (match a real term sheet)"):
+                min_dscr = st.number_input("Minimum DSCR", 0.50, 2.00,
+                                           base_program.min_dscr, step=0.05,
+                                           disabled=not dscr_on)
+                max_ltv = st.number_input("Max LTV (%)", 30.0, 90.0,
+                                          base_program.max_ltv * 100, step=5.0,
+                                          disabled=not dscr_on)
+                dscr_rate = st.number_input("Rate (%)", 3.0, 15.0,
+                                           base_program.rate * 100, step=0.125,
+                                           disabled=not dscr_on)
+                io_on = st.toggle("Interest-only", value=base_program.interest_only,
+                                  disabled=not dscr_on)
+                io_years = st.number_input("Interest-only years", 1, 15,
+                                           base_program.io_years, step=1,
+                                           disabled=not (dscr_on and io_on))
+                points = st.number_input("Points (% of loan)", 0.0, 5.0,
+                                        base_program.points_pct * 100, step=0.25,
+                                        disabled=not dscr_on)
+            program = dscr.DscrProgram(
+                name=tier_pick, min_dscr=min_dscr, max_ltv=max_ltv / 100,
+                rate=dscr_rate / 100, term_years=base_program.term_years,
+                interest_only=io_on, io_years=int(io_years),
+                points_pct=points / 100,
+                other_closing_pct=base_program.other_closing_pct,
+                prepay_step_down=base_program.prepay_step_down)
+
     assume = Assumptions(
         years=int(years), n_trials=int(n_trials),
         appreciation_mean=app_mean / 100, appreciation_stdev=app_std / 100,
@@ -1248,14 +1419,16 @@ def main():
         capital_gains_rate=cg / 100, recapture_rate=recap / 100,
         refi_enabled=refi_on, refi_year=int(refi_yr), refi_rate=refi_rate / 100,
         refi_term_years=int(refi_term), refi_ltv=refi_ltv / 100,
-        refi_cost_pct=refi_cost / 100)
+        refi_cost_pct=refi_cost / 100,
+        dscr_loan_enabled=dscr_on, dscr_program=program if dscr_on else None)
 
     deals = [deal_a] + ([deal_b] if compare else [])
-    for d in deals:
-        if d.down_payment_pct <= 0:
-            st.error(f"{d.label}: down payment must be > 0% — cash-on-cash return "
-                     "is undefined with no cash invested.")
-            st.stop()
+    if not dscr_on:
+        for d in deals:
+            if d.down_payment_pct <= 0:
+                st.error(f"{d.label}: down payment must be > 0% — cash-on-cash "
+                         "return is undefined with no cash invested.")
+                st.stop()
 
     results = [run_simulation(d, assume) for d in deals]
     sums = [summary_row(r) for r in results]
@@ -1377,32 +1550,77 @@ def main():
                "year at least this bad, so it is a sensible reserve target.")
 
     # ---------------- 4. DSCR lender view
-    st.subheader("4 · Would a lender fund this?")
-    st.caption("Rental-property lenders check whether the rent covers the "
-               "mortgage. They call it DSCR; 1.25 means rent covers the payment "
-               "1.25 times over. Below 1.15 most lenders say no.")
+    st.subheader("4 · What a lender will actually lend")
+    st.caption("A DSCR lender qualifies the deal on gross rent over PITIA "
+               "(principal, interest, taxes, insurance, HOA) — not on net "
+               "operating income over principal and interest. The two "
+               "numbers disagree, sometimes enough to flip the verdict, so "
+               "both are shown: the lender's number decides fundability, the "
+               "stricter investor number is the honest all-in test.")
     lo_t, hi_t = assume.dscr_thresholds
     for lab, s in zip(labels, sums):
-        d1, d2, d3 = st.columns(3)
-        d1.metric(f"{lab} · rent covers the mortgage", ratio(s["dscr_median"]))
-        d2.metric(f"Odds a lenient lender says yes ({lo_t:.2f})",
-                  pct(s["dscr_pass_115"]))
-        d3.metric(f"Odds a strict lender says yes ({hi_t:.2f})",
-                  pct(s["dscr_pass_125"]))
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric(f"{lab} · lender DSCR (gross rent / PITIA)",
+                  ratio(s["dscr_lender_median"]))
+        d2.metric("Investor DSCR (NOI / P&I) — stricter",
+                  ratio(s["dscr_median"]))
+        d3.metric(f"Odds a lenient lender says yes ({lo_t:.2f})",
+                  pct(s["dscr_lender_pass_115"]))
+        d4.metric(f"Odds a strict lender says yes ({hi_t:.2f})",
+                  pct(s["dscr_lender_pass_125"]))
     dscr_series = []
     for l, r in zip(labels, results):
-        v = r["dscr"][:, 0]
+        v = r["dscr_lender"][:, 0]
         v = v[np.isfinite(v)]
         if v.size:
             dscr_series.append((l, np.clip(v, 0, 3.0)))
     if dscr_series:
         st.altair_chart(dist_chart(
-            dscr_series, "How many times the rent covers the mortgage (year 1)",
+            dscr_series, "Lender DSCR — gross rent over PITIA (year 1)",
             alt, fmt=".2f"), use_container_width=True)
-    st.caption(f"Worked out as rent left after vacancy, management, maintenance, "
-               f"taxes, insurance and HOA, divided by the year's mortgage "
-               f"payments. Big one-off repairs are excluded, which is how lenders "
-               f"do it. Cash purchases show as n/a because there's no loan.")
+    st.caption("Lender convention: gross scheduled rent divided by principal, "
+               "interest, taxes, insurance and HOA for the year — no haircut "
+               "for vacancy, management or maintenance, which is why it reads "
+               "higher than the investor number above. Cash purchases show as "
+               "n/a because there's no loan.")
+
+    if assume.dscr_loan_enabled and assume.dscr_program is not None:
+        st.markdown("###### What the program actually sizes")
+        for lab, r in zip(labels, results):
+            siz = r["dscr_sizing"]
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric(f"{lab} · max loan", usd(siz["loan"]))
+            e2.metric("Binding constraint",
+                     "DSCR minimum" if siz["binding"] == "dscr" else "Loan-to-value")
+            e3.metric("Down payment", usd(siz["down_payment"]))
+            e4.metric("Cash to close (incl. points)", usd(siz["cash_to_close"]))
+        st.caption("A DSCR-bound deal gets a bigger loan from more rent; an "
+                   "LTV-bound one doesn't — more rent just leaves unused room "
+                   "under the DSCR floor. Points and other closing costs are "
+                   "counted in cash to close and in cash-on-cash above, so "
+                   "returns aren't overstated.")
+
+        st.markdown("###### How the three standard tiers compare")
+        for lab, d in zip(labels, deals):
+            rows = dscr.compare_programs(d.purchase_price, d.monthly_rent,
+                                         d.taxes_annual, d.insurance_annual,
+                                         hoa_m=d.hoa_monthly)
+            df = pd.DataFrame([{
+                "Program": row["program"],
+                "Max loan": usd(row["loan"]),
+                "Binding": "DSCR" if row["binding"] == "dscr" else "LTV",
+                "Down payment": usd(row["down_payment"]),
+                "Cash to close": usd(row["cash_to_close"]),
+                "DSCR at that loan": ratio(row["dscr"]),
+            } for row in rows])
+            if len(deals) > 1:
+                st.caption(lab)
+            st.dataframe(df, hide_index=True, use_container_width=True)
+        st.caption("Each program priced independently against this deal's "
+                   "price, rent, taxes and insurance — not the editable tier "
+                   "above, so this always shows the honest market spread. "
+                   "Edit and re-run the tiers in Assumptions to match a real "
+                   "term sheet before quoting a client.")
 
     # ---------------- 5. refi impact
     if assume.refi_enabled:
@@ -1435,7 +1653,10 @@ def main():
                 f"{yrs}-yr IRR{tax_tag} (%)": r[irr_key][np.isfinite(r[irr_key])] * 100,
                 "Year-1 cash flow ($)": a_cf[:, 0],
                 f"Year-{yrs} cash flow ($)": a_cf[:, -1],
-                "Year-1 DSCR": r["dscr"][:, 0][np.isfinite(r["dscr"][:, 0])],
+                "Year-1 DSCR — investor (NOI/P&I)":
+                    r["dscr"][:, 0][np.isfinite(r["dscr"][:, 0])],
+                "Year-1 DSCR — lender (rent/PITIA)":
+                    r["dscr_lender"][:, 0][np.isfinite(r["dscr_lender"][:, 0])],
                 "Value at exit ($)": r["value_by_year"][:, -1],
                 "Equity at exit ($)": (r["equity_after_tax"] if assume.tax_enabled
                                        else r["equity_at_exit"]),
